@@ -1,12 +1,12 @@
+
+
 #include <stdint.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <openssl/evp.h>
-
-#include "hash.h"
+#include "hash_functions.h"
 
 #define KEEP 16
 #define ALGORITHM_COUNT 4
@@ -51,7 +51,6 @@ typedef struct
 	size_t group_count;
 	size_t begin;
 	size_t end;
-	const EVP_MD *algorithms[ALGORITHM_COUNT];
 	MatchEvent *events;
 	size_t event_count;
 	size_t event_capacity;
@@ -81,6 +80,25 @@ static Password *load_passwords(const char *path, size_t *count, char **storage)
 		failure("cannot open password file");
 
 	size_t buffer_capacity = 1 << 20;
+	/* Size regular files up front to avoid repeated growth and copying.
+	 * Keep the previous streaming strategy for non-seekable input. */
+	if (fseek(fp, 0, SEEK_END) == 0)
+	{
+		long file_length = ftell(fp);
+		if (file_length >= 0 && fseek(fp, 0, SEEK_SET) == 0)
+		{
+			if ((size_t)file_length >= buffer_capacity)
+				buffer_capacity = (size_t)file_length + 1;
+		}
+		else
+		{
+			rewind(fp);
+		}
+	}
+	else
+	{
+		clearerr(fp);
+	}
 	char *data = checked_realloc(NULL, buffer_capacity + 1);
 	size_t used = 0;
 
@@ -126,6 +144,8 @@ static Password *load_passwords(const char *path, size_t *count, char **storage)
 			passwords = checked_realloc(passwords, capacity * sizeof(*passwords));
 		}
 		passwords[*count].text = data + begin;
+		/* strlen matches the baseline's C-string interpretation, including
+		 * the unusual case of an embedded zero byte in an input token. */
 		passwords[*count].length = (unsigned int)strlen(data + begin);
 		(*count)++;
 	}
@@ -188,16 +208,13 @@ static int hex_to_bytes(const char *hex, unsigned char bytes[KEEP])
 	return 1;
 }
 
-/* A fast table index; full 16-byte equality is still checked after probing. */
+/* Cryptographic digest prefixes are already well distributed, so hashing
+ * the prefix again is unnecessary. Full 16-byte equality checks prevent any
+ * lookup collisions from producing false matches. */
 static uint64_t digest_hash(const unsigned char digest[KEEP])
 {
-	uint64_t a, b;
-	memcpy(&a, digest, sizeof(a));
-	memcpy(&b, digest + sizeof(a), sizeof(b));
-	uint64_t value = a ^ (b * UINT64_C(0x9e3779b97f4a7c15));
-	value ^= value >> 33;
-	value *= UINT64_C(0xff51afd7ed558ccd);
-	value ^= value >> 33;
+	uint64_t value;
+	memcpy(&value, digest, sizeof(value));
 	return value;
 }
 
@@ -206,9 +223,18 @@ static size_t *build_index(Target *targets, size_t target_count,
 						   TargetGroup **groups_out, size_t *group_count_out,
 						   size_t *slot_mask_out)
 {
+	/* Keep sparse tables for fast negative lookups. Cap table expansion for
+	 * large target lists so index storage remains modest on 6 GB systems. */
 	size_t slot_count = 32;
-	while (slot_count < 2 * target_count)
+	size_t factor = target_count <= 4096 ? 16 : 4;
+	if (target_count > SIZE_MAX / factor)
+		failure("target index size exceeds available address space");
+	while (slot_count < factor * target_count)
+	{
+		if (slot_count > SIZE_MAX / 2)
+			failure("target index size exceeds available address space");
 		slot_count *= 2;
+	}
 
 	size_t *slots = calloc(slot_count, sizeof(*slots));
 	if (slots == NULL)
@@ -260,7 +286,10 @@ static size_t find_target(const Worker *worker, const unsigned char digest[KEEP]
 	while (worker->slots[slot] != 0)
 	{
 		size_t index = worker->slots[slot] - 1;
-		if (memcmp(worker->groups[index].digest, digest, KEEP) == 0)
+		/* Most table collisions fail this one-byte fingerprint check,
+		 * avoiding a full 16-byte comparison. */
+		if (worker->groups[index].digest[7] == digest[7] &&
+			memcmp(worker->groups[index].digest, digest, KEEP) == 0)
 			return index;
 		slot = (slot + 1) & worker->slot_mask;
 	}
@@ -283,21 +312,18 @@ static void add_event(Worker *worker, size_t password_index,
 	event->algorithm_index = (unsigned char)algorithm_index;
 }
 
-/* Every worker owns its contexts and event list; target lookup is read-only. */
+/* Every worker owns its event list; the indexed targets are read-only. */
 static void *hash_password_range(void *arg)
 {
 	Worker *worker = arg;
-	EVP_MD_CTX *contexts[ALGORITHM_COUNT];
+	/* The project-provided functions return heap-allocated digest buffers.
+	 * Every returned buffer must be freed after its 16-byte prefix is checked. */
+	unsigned char *(*const hash_functions[ALGORITHM_COUNT])(
+		unsigned char *, unsigned int) = {
+		calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
 	size_t *recorded = calloc(worker->group_count, sizeof(*recorded));
 	if (recorded == NULL)
 		failure("cannot allocate per-worker match counts");
-
-	for (int i = 0; i < ALGORITHM_COUNT; i++)
-	{
-		contexts[i] = EVP_MD_CTX_new();
-		if (contexts[i] == NULL)
-			failure("cannot create OpenSSL context");
-	}
 
 	for (size_t i = worker->begin; i < worker->end; i++)
 	{
@@ -306,15 +332,13 @@ static void *hash_password_range(void *arg)
 		/* Preserve MD5, SHA1, SHA256, SHA512 ordering for each password. */
 		for (int a = 0; a < ALGORITHM_COUNT; a++)
 		{
-			unsigned char digest[EVP_MAX_MD_SIZE];
-			unsigned int digest_length = 0;
-			if (!EVP_DigestInit_ex(contexts[a], worker->algorithms[a], NULL) ||
-				!EVP_DigestUpdate(contexts[a], password->text, password->length) ||
-				!EVP_DigestFinal_ex(contexts[a], digest, &digest_length) ||
-				digest_length < KEEP)
-				failure("OpenSSL digest computation failed");
+			unsigned char *digest = hash_functions[a](
+				(unsigned char *)password->text, password->length);
+			if (digest == NULL)
+				failure("digest computation failed");
 
 			size_t group = find_target(worker, digest);
+			free(digest);
 			/* A worker needs at most one event per target slot per digest.
 			 * Discard later matches locally without changing merge order. */
 			if (group != NO_INDEX &&
@@ -326,8 +350,6 @@ static void *hash_password_range(void *arg)
 		}
 	}
 
-	for (int i = 0; i < ALGORITHM_COUNT; i++)
-		EVP_MD_CTX_free(contexts[i]);
 	free(recorded);
 	return NULL;
 }
@@ -349,8 +371,6 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 		char *password_storage = NULL;
 		Password *passwords = load_passwords(password_list, &password_count,
 											 &password_storage);
-		const EVP_MD *algorithms[ALGORITHM_COUNT] = {
-			EVP_md5(), EVP_sha1(), EVP_sha256(), EVP_sha512()};
 		const char *algorithm_names[ALGORITHM_COUNT] = {
 			"MD5", "SHA1", "SHA256", "SHA512"};
 		/* A sequential path avoids thread overhead for small dictionaries. */
@@ -370,7 +390,6 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 			worker->group_count = group_count;
 			worker->begin = password_count * (size_t)i / (size_t)worker_count;
 			worker->end = password_count * (size_t)(i + 1) / (size_t)worker_count;
-			memcpy(worker->algorithms, algorithms, sizeof(algorithms));
 		}
 
 		/* Three pthreads plus the main thread: four concurrent threads total. */
