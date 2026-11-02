@@ -1,11 +1,19 @@
 
-
+/*
+ * Group: WDTQ
+ * Names: Waylon Erlandson, Dang Cuong Nguyen, Tan Hoang Khoa Nguyen, Quang Hien Tran
+ * NetIDs: waylonerlandson
+ * UID: U85547824
+ * Description: Reduces execution time of a program that determines which password in one file
+ * generates each hash in another file through multi-threaded programming and hashing. Each hash
+ * is produced from one of the MD5, SHA1, SHA256, or SHA512 cryptographic hash functions */
 #include <stdint.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+
 #include "hash_functions.h"
 
 #define KEEP 16
@@ -13,12 +21,14 @@
 #define WORKER_COUNT 4
 #define NO_INDEX ((size_t)-1)
 
+/* Stores variable-sized password information */
 typedef struct
 {
 	char *text;
 	unsigned int length;
 } Password;
 
+/* Stores target hash information */
 typedef struct
 {
 	char hex[2 * KEEP + 1];
@@ -27,6 +37,7 @@ typedef struct
 	size_t next_duplicate;
 } Target;
 
+/* Structure for storing identical hashes together */
 typedef struct
 {
 	unsigned char digest[KEEP];
@@ -35,6 +46,7 @@ typedef struct
 	size_t target_count;
 } TargetGroup;
 
+/* Records a match between a password and hash group, storing the algorithm used */
 typedef struct
 {
 	size_t password_index;
@@ -42,6 +54,7 @@ typedef struct
 	unsigned char algorithm_index;
 } MatchEvent;
 
+/* Stores the information of the section of the dictionary assigned to a given thread */
 typedef struct
 {
 	const Password *passwords;
@@ -56,13 +69,14 @@ typedef struct
 	size_t event_capacity;
 } Worker;
 
-/* Always fail explicitly rather than silently producing incomplete results. */
+/* Helper function for failing explicitly rather than silently producing incomplete results */
 static void failure(const char *message)
 {
 	fprintf(stderr, "project2: %s\n", message);
 	exit(EXIT_FAILURE);
 }
 
+/* Ensures reallocation does not fail silently */
 static void *checked_realloc(void *ptr, size_t size)
 {
 	void *new_ptr = realloc(ptr, size);
@@ -71,17 +85,18 @@ static void *checked_realloc(void *ptr, size_t size)
 	return new_ptr;
 }
 
-/* Read in bulk, then tokenize in place according to fscanf("%s") rules.
- * One shared storage block avoids a million tiny allocations and frees. */
+/* Read passwords in bulk, then tokenize in place according to fscanf("%s") rules.
+ * One shared storage block avoids a million tiny allocations and frees */
 static Password *load_passwords(const char *path, size_t *count, char **storage)
 {
 	FILE *fp = fopen(path, "rb");
 	if (fp == NULL)
 		failure("cannot open password file");
 
+	/* Size buffer capacity up front to avoid repeated growth and copying */
 	size_t buffer_capacity = 1 << 20;
-	/* Size regular files up front to avoid repeated growth and copying.
-	 * Keep the previous streaming strategy for non-seekable input. */
+
+	/* Attempts to determine the file size, resizing if necessary */
 	if (fseek(fp, 0, SEEK_END) == 0)
 	{
 		long file_length = ftell(fp);
@@ -99,9 +114,11 @@ static Password *load_passwords(const char *path, size_t *count, char **storage)
 	{
 		clearerr(fp);
 	}
+
 	char *data = checked_realloc(NULL, buffer_capacity + 1);
 	size_t used = 0;
 
+	/* Reads passwords in bulk until there is nothing to read */
 	for (;;)
 	{
 		if (used == buffer_capacity)
@@ -125,6 +142,7 @@ static Password *load_passwords(const char *path, size_t *count, char **storage)
 	Password *passwords = checked_realloc(NULL, capacity * sizeof(*passwords));
 	*count = 0;
 
+	/* Delimits passwords, storing them in the passwords array */
 	for (size_t pos = 0; pos < used;)
 	{
 		while (pos < used && isspace((unsigned char)data[pos]))
@@ -145,7 +163,7 @@ static Password *load_passwords(const char *path, size_t *count, char **storage)
 		}
 		passwords[*count].text = data + begin;
 		/* strlen matches the baseline's C-string interpretation, including
-		 * the unusual case of an embedded zero byte in an input token. */
+		 * the unusual case of an embedded zero byte in an input token */
 		passwords[*count].length = (unsigned int)strlen(data + begin);
 		(*count)++;
 	}
@@ -153,6 +171,7 @@ static Password *load_passwords(const char *path, size_t *count, char **storage)
 	return passwords;
 }
 
+/* Reads hashes in one pass, resizing if necessary */
 static Target *load_targets(const char *path, size_t *count)
 {
 	FILE *fp = fopen(path, "r");
@@ -184,7 +203,7 @@ static Target *load_targets(const char *path, size_t *count)
 	return targets;
 }
 
-/* Only lowercase hex can match the baseline's lowercase digest formatting. */
+/* Converts target hash to binary representation, avoiding string formatting for future comparisons */
 static int hex_to_bytes(const char *hex, unsigned char bytes[KEEP])
 {
 	if (strlen(hex) != 2 * KEEP)
@@ -210,7 +229,7 @@ static int hex_to_bytes(const char *hex, unsigned char bytes[KEEP])
 
 /* Cryptographic digest prefixes are already well distributed, so hashing
  * the prefix again is unnecessary. Full 16-byte equality checks prevent any
- * lookup collisions from producing false matches. */
+ * lookup collisions from producing false matches */
 static uint64_t digest_hash(const unsigned char digest[KEEP])
 {
 	uint64_t value;
@@ -224,7 +243,7 @@ static size_t *build_index(Target *targets, size_t target_count,
 						   size_t *slot_mask_out)
 {
 	/* Keep sparse tables for fast negative lookups. Cap table expansion for
-	 * large target lists so index storage remains modest on 6 GB systems. */
+	 * large target lists so index storage remains small on 6 GB systems */
 	size_t slot_count = 32;
 	size_t factor = target_count <= 4096 ? 16 : 4;
 	if (target_count > SIZE_MAX / factor)
@@ -236,6 +255,7 @@ static size_t *build_index(Target *targets, size_t target_count,
 		slot_count *= 2;
 	}
 
+	/* 0 is used to represent an empty slot. Calloc is used to initialize each slot to 0 */
 	size_t *slots = calloc(slot_count, sizeof(*slots));
 	if (slots == NULL)
 		failure("cannot allocate digest index");
@@ -251,6 +271,7 @@ static size_t *build_index(Target *targets, size_t target_count,
 		if (!hex_to_bytes(targets[i].hex, digest))
 			continue;
 
+		/* Uses linear probing to locate position for hash */
 		size_t slot = (size_t)digest_hash(digest) & mask;
 		while (slots[slot] != 0 &&
 			   memcmp(groups[slots[slot] - 1].digest, digest, KEEP) != 0)
@@ -280,6 +301,7 @@ static size_t *build_index(Target *targets, size_t target_count,
 	return slots;
 }
 
+/* Searches slots for a given digest */
 static size_t find_target(const Worker *worker, const unsigned char digest[KEEP])
 {
 	size_t slot = (size_t)digest_hash(digest) & worker->slot_mask;
@@ -287,7 +309,7 @@ static size_t find_target(const Worker *worker, const unsigned char digest[KEEP]
 	{
 		size_t index = worker->slots[slot] - 1;
 		/* Most table collisions fail this one-byte fingerprint check,
-		 * avoiding a full 16-byte comparison. */
+		 * avoiding a full 16-byte comparison */
 		if (worker->groups[index].digest[7] == digest[7] &&
 			memcmp(worker->groups[index].digest, digest, KEEP) == 0)
 			return index;
@@ -296,6 +318,7 @@ static size_t find_target(const Worker *worker, const unsigned char digest[KEEP]
 	return NO_INDEX;
 }
 
+/* Stores a match in worker's event array */
 static void add_event(Worker *worker, size_t password_index,
 					  size_t group_index, unsigned int algorithm_index)
 {
@@ -312,12 +335,12 @@ static void add_event(Worker *worker, size_t password_index,
 	event->algorithm_index = (unsigned char)algorithm_index;
 }
 
-/* Every worker owns its event list; the indexed targets are read-only. */
+/* Every worker owns its event list; the indexed targets are read-only */
 static void *hash_password_range(void *arg)
 {
 	Worker *worker = arg;
 	/* The project-provided functions return heap-allocated digest buffers.
-	 * Every returned buffer must be freed after its 16-byte prefix is checked. */
+	 * Every returned buffer must be freed after its 16-byte prefix is checked */
 	unsigned char *(*const hash_functions[ALGORITHM_COUNT])(
 		unsigned char *, unsigned int) = {
 		calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
@@ -329,7 +352,7 @@ static void *hash_password_range(void *arg)
 	{
 		const Password *password = &worker->passwords[i];
 
-		/* Preserve MD5, SHA1, SHA256, SHA512 ordering for each password. */
+		/* Preserve MD5, SHA1, SHA256, SHA512 ordering for each password */
 		for (int a = 0; a < ALGORITHM_COUNT; a++)
 		{
 			unsigned char *digest = hash_functions[a](
@@ -340,7 +363,7 @@ static void *hash_password_range(void *arg)
 			size_t group = find_target(worker, digest);
 			free(digest);
 			/* A worker needs at most one event per target slot per digest.
-			 * Discard later matches locally without changing merge order. */
+			 * Discard later matches locally without changing merge order */
 			if (group != NO_INDEX &&
 				recorded[group] < worker->groups[group].target_count)
 			{
@@ -354,6 +377,8 @@ static void *hash_password_range(void *arg)
 	return NULL;
 }
 
+/* Loads password and hash files into memory, splits password into 4 contiguous ranges,
+ * and creates three threads alongside the main thread to process the ranges */
 void crack_hashed_passwords(char *password_list, char *hashed_list, char *output)
 {
 	size_t target_count = 0;
@@ -364,7 +389,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 	size_t *slots = build_index(targets, target_count, &groups,
 								&group_count, &slot_mask);
 
-	/* Empty or nonmatching-format target files need no digest computations. */
+	/* Empty or nonmatching-format target files need no digest computations */
 	if (group_count != 0)
 	{
 		size_t password_count = 0;
@@ -373,13 +398,13 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 											 &password_storage);
 		const char *algorithm_names[ALGORITHM_COUNT] = {
 			"MD5", "SHA1", "SHA256", "SHA512"};
-		/* A sequential path avoids thread overhead for small dictionaries. */
+		/* A sequential path avoids thread overhead for small dictionaries */
 		int worker_count = password_count < 8192 ? 1 : WORKER_COUNT;
 		Worker workers[WORKER_COUNT] = {0};
 		pthread_t threads[WORKER_COUNT - 1];
 		int started[WORKER_COUNT - 1] = {0};
 
-		/* Contiguous ranges make each worker's events already dictionary-sorted. */
+		/* Contiguous ranges make each worker's events already dictionary-sorted */
 		for (int i = 0; i < worker_count; i++)
 		{
 			Worker *worker = &workers[i];
@@ -392,7 +417,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 			worker->end = password_count * (size_t)(i + 1) / (size_t)worker_count;
 		}
 
-		/* Three pthreads plus the main thread: four concurrent threads total. */
+		/* Three pthreads plus the main thread: four concurrent threads total */
 		for (int i = 1; i < worker_count; i++)
 		{
 			if (pthread_create(&threads[i - 1], NULL,
@@ -409,7 +434,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 		}
 
 		/* Replaying matches in (password, algorithm) order preserves the
-		 * baseline's first-unmatched-target rule, even with duplicates. */
+		 * first-unmatched-target rule, even with duplicates */
 		for (int i = 0; i < worker_count; i++)
 		{
 			Worker *worker = &workers[i];
@@ -428,7 +453,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 			free(worker->events);
 		}
 
-		/* Matched password storage remains valid until after output is written. */
+		/* Matched password storage remains valid until after output is written */
 		FILE *fp = fopen(output, "w");
 		if (fp == NULL)
 			failure("cannot open output file");
